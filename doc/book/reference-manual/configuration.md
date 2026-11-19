@@ -17,6 +17,7 @@ metadata_snapshots_dir = "/var/lib/garage/snapshots"
 metadata_fsync = true
 data_fsync = false
 disable_scrub = false
+dedup_verify = false
 use_local_tz = false
 metadata_auto_snapshot_interval = "6h"
 
@@ -114,6 +115,7 @@ Top-level configuration options, in alphabetical order:
 [`data_dir`](#data_dir),
 [`data_fsync`](#data_fsync),
 [`db_engine`](#db_engine),
+[`dedup_verify`](#dedup_verify),
 [`disable_scrub`](#disable_scrub),
 [`lmdb_map_size`](#lmdb_map_size),
 [`metadata_auto_snapshot_interval`](#metadata_auto_snapshot_interval),
@@ -453,6 +455,29 @@ at the cost of a moderate drop in write performance.
 
 Similarly to `metadata_fsync`, this is likely not necessary
 if geographical replication is used.
+
+#### `dedup_verify` {#dedup_verify}
+
+Whether to compare the bytes of a block that is already stored on this node with
+an incoming block of the same hash before deduplicating against it.
+This is disabled (`false`) by default.
+
+Garage addresses data blocks by the 256-bit BLAKE2b hash of their contents, and
+a block whose hash is already present is treated as the same data without
+comparing the bytes.  A hash collision would therefore silently serve one
+object's bytes in place of another's.  Finding one is far out of reach (about
+2^128 operations for an accidental collision, and 2^256 for a chosen second
+preimage), but a cluster that cannot accept the risk can ask Garage to prove
+that a dedup hit is genuine.
+
+Verification reads the stored block (which is usually still in the page cache)
+and decompresses it when [`compression_level`](#compression_level) is enabled,
+whenever a block of the same hash is already present on the node.  A collision
+is refused with an error instead of aliasing the two blocks; a stored block
+that no longer matches its own hash is moved aside and rewritten from the
+incoming copy.  Failures are counted by the `block.dedup_verify_failed` metric.
+
+This is a per-node setting: enable it on every node that stores data blocks.
 
 #### `metadata_auto_snapshot_interval` (since `v0.9.4`) {#metadata_auto_snapshot_interval}
 

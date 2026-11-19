@@ -27,6 +27,12 @@ pub struct Config {
 	#[serde(default)]
 	pub disable_scrub: bool,
 
+	/// Compare the bytes of a block already stored on this node with an
+	/// incoming block of the same hash before deduplicating against it
+	/// (disabled by default)
+	#[serde(default)]
+	pub dedup_verify: bool,
+
 	/// Use local timezone
 	#[serde(default)]
 	pub use_local_tz: bool,

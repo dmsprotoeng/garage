@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::convert::TryInto;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -85,6 +86,7 @@ pub struct BlockManager {
 	data_fsync: bool,
 	compression_level: Option<i32>,
 	disable_scrub: bool,
+	dedup_verify: bool,
 
 	mutation_lock: Vec<Mutex<BlockManagerLocked>>,
 	read_semaphore: Semaphore,
@@ -171,6 +173,7 @@ impl BlockManager {
 			data_layout_persister,
 			data_fsync: config.data_fsync,
 			disable_scrub: config.disable_scrub,
+			dedup_verify: config.dedup_verify,
 			compression_level: config.compression_level,
 			mutation_lock: [(); MUTEX_COUNT]
 				.iter()
@@ -759,7 +762,54 @@ impl BlockManagerLocked {
 			tgt_path.set_extension("zst");
 		}
 
-		let existing_info = existing_path.map(|x| x.into_parts());
+		let mut existing_info = existing_path.map(|x| x.into_parts());
+
+		// A dedup hit decides to serve the block already on disk for a new
+		// object. The hash is an address, not a proof, so verify the stored
+		// copy before reusing it: a collision would otherwise silently alias
+		// two different payloads.
+		if mgr.dedup_verify {
+			if let Some((stored_header, stored_path)) = existing_info.clone() {
+				let incoming = block_payload(header, data)?;
+				// A read error is not evidence about the block's content, so it
+				// propagates. A block that cannot even be decoded is corrupt.
+				let raw = fs::read(&stored_path).await?;
+				mgr.metrics.bytes_read.add(raw.len() as u64, &[]);
+				let stored = block_payload(stored_header, &raw).ok();
+				let check = match stored {
+					Some(stored) => check_dedup(hash, &stored, &incoming),
+					None => DedupCheck::Rewrite,
+				};
+				match check {
+					DedupCheck::Reuse => {}
+					DedupCheck::Rewrite => {
+						// Not a collision: the stored file no longer matches
+						// the hash it is filed under. Move it aside so the
+						// write below repairs it instead of deduplicating
+						// onto it.
+						warn!(
+							"Block {:?} stored on disk is corrupt, replacing it from the incoming copy.",
+							hash
+						);
+						mgr.metrics.dedup_verify_failed.add(1, &[]);
+						self.move_block_to_corrupted(&DataBlockPath::from_parts(
+							stored_header,
+							stored_path,
+						))
+						.await?;
+						existing_info = None;
+					}
+					DedupCheck::Collision => {
+						mgr.metrics.dedup_verify_failed.add(1, &[]);
+						return Err(Error::Message(format!(
+							"Block {:?} is already stored with different content: refusing to deduplicate a hash collision.",
+							hash
+						)));
+					}
+				}
+			}
+		}
+
 		let to_delete = match (existing_info, compressed) {
 			// If the block is stored in the wrong directory,
 			// write it again at the correct path and delete the old path
@@ -873,5 +923,91 @@ impl Drop for DeleteOnDrop {
 				}
 			});
 		}
+	}
+}
+
+/// Outcome of checking a block that is already stored under the same hash.
+#[derive(Debug, PartialEq, Eq)]
+enum DedupCheck {
+	/// The stored bytes hold the same data: the block can be reused.
+	Reuse,
+	/// The stored bytes do not match their own hash: they are corrupt, not a
+	/// dedup candidate, and must be replaced.
+	Rewrite,
+	/// The stored bytes are valid for this hash but differ from the incoming
+	/// bytes: a hash collision, which deduplication must never resolve.
+	Collision,
+}
+
+fn check_dedup(hash: &Hash, stored: &[u8], incoming: &[u8]) -> DedupCheck {
+	if blake2sum(stored) != *hash {
+		return DedupCheck::Rewrite;
+	}
+	if stored != incoming {
+		return DedupCheck::Collision;
+	}
+	DedupCheck::Reuse
+}
+
+/// Return the bytes a block's hash was computed over. Blocks are hashed before
+/// being compressed, so a compressed block is decompressed before it can be
+/// compared with another copy.
+fn block_payload<'a>(header: DataBlockHeader, raw: &'a [u8]) -> Result<Cow<'a, [u8]>, Error> {
+	match header {
+		DataBlockHeader::Plain => Ok(Cow::Borrowed(raw)),
+		DataBlockHeader::Compressed => Ok(Cow::Owned(zstd::stream::decode_all(raw)?)),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn dedup_reuses_identical_bytes() {
+		let payload = b"a block payload".to_vec();
+		assert_eq!(
+			check_dedup(&blake2sum(&payload), &payload, &payload),
+			DedupCheck::Reuse
+		);
+	}
+
+	#[test]
+	fn dedup_refuses_bytes_that_collide_with_a_stored_block() {
+		let stored = b"the first payload".to_vec();
+		// Valid for its own hash, but different from the stored bytes: the
+		// only way this happens is a collision, and deduplicating would serve
+		// one object's bytes for the other's.
+		assert_eq!(
+			check_dedup(&blake2sum(&stored), &stored, b"the second payload"),
+			DedupCheck::Collision
+		);
+	}
+
+	#[test]
+	fn dedup_replaces_a_stored_block_that_does_not_match_its_hash() {
+		let incoming = b"a block payload".to_vec();
+		assert_eq!(
+			check_dedup(&blake2sum(&incoming), b"bit rot", &incoming),
+			DedupCheck::Rewrite
+		);
+	}
+
+	#[test]
+	fn block_payload_yields_the_bytes_the_hash_covers() {
+		let payload = vec![b'a'; 4096];
+		let compressed = zstd::stream::encode_all(&payload[..], 3).unwrap();
+		assert_eq!(
+			block_payload(DataBlockHeader::Compressed, &compressed)
+				.unwrap()
+				.as_ref(),
+			&payload[..]
+		);
+		assert_eq!(
+			block_payload(DataBlockHeader::Plain, &payload)
+				.unwrap()
+				.as_ref(),
+			&payload[..]
+		);
 	}
 }

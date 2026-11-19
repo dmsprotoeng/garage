@@ -30,6 +30,7 @@ pub struct BlockManagerMetrics {
 	pub(crate) delete_counter: Counter<u64>,
 
 	pub(crate) corruption_counter: Counter<u64>,
+	pub(crate) dedup_verify_failed: Counter<u64>,
 }
 
 impl BlockManagerMetrics {
@@ -139,6 +140,13 @@ impl BlockManagerMetrics {
 			corruption_counter: meter
 				.u64_counter("block.corruption_counter")
 				.with_description("Data corruptions detected on block reads")
+				.build(),
+
+			dedup_verify_failed: meter
+				.u64_counter("block.dedup_verify_failed")
+				.with_description(
+					"Stored blocks that did not match an incoming block of the same hash",
+				)
 				.build(),
 		}
 	}
